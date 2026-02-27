@@ -1,0 +1,10 @@
+[WLED]
+WLED_IP = 10.16.111.1
+WLED_PORT = 11988
+
+[Audio]
+SAMPLE_RATE = 48000
+# Bytes per frame (s16le: 2 bytes/sample). Lower = less latency, coarser FFT.
+# 512 = 256 samples ≈ 5.3 ms   256 = 128 samples ≈ 2.7 ms   1024 = 512 samples ≈ 10.7 ms
+CHUNK_BYTES = 512
+gain = 1.0

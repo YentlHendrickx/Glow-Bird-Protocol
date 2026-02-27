@@ -1,0 +1,13 @@
+# Alle Dot-Files und Dot-Directories ignorieren
+.*
+# Ausnahme: .gitignore und .git
+!.gitignore
+!.git/
+
+# HTML-Dateien ignorieren
+*.html
+
+# VSCode-Dateien ignorieren
+.vscode/
+*.code-workspace
+
