@@ -1,0 +1,14 @@
+[Unit]
+Description=WLED Audio Reactive Visualizer
+After=pipewire-pulse.service
+Wants=pipewire-pulse.service
+
+[Service]
+Type=simple
+WorkingDirectory=/project/dir
+ExecStart=/usr/bin/python3 /project/dir/main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

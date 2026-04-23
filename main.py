@@ -89,11 +89,16 @@ def run_loopback():
             bufsize=CHUNK_BYTES,
         )
         print(f"Started parec @DEFAULT_MONITOR@ (chunk={CHUNK_BYTES} bytes ≈ {CHUNK_MSEC:.1f} ms latency).")
-    except FileNotFoundError:
-        sys.exit("parec not found. Install pulseaudio-utils or libpulse (Arch: pacman -S libpulse).")
+    except Exception as e:
+        if isinstance(e, FileNotFoundError):
+            sys.exit("parec not found. Install pulseaudio-utils or libpulse (Arch: pacman -S libpulse).")
+        else:
+            sys.exit(f"Error starting parec: {e}")
     while True:
         raw = proc.stdout.read(CHUNK_BYTES)
         if len(raw) < CHUNK_BYTES:
+            stderr = proc.stderr.read().decode()
+            print(f"Parec exited earlier than expected. Stderr: {stderr}", flush=True)
             break
         fft_result = calculate_fft(raw)
         if fft_result[0] is None:
