@@ -1,10 +1,39 @@
 [WLED]
-WLED_IP = 10.16.111.1
+WLED_IP = 10.16.111.2
 WLED_PORT = 11988
 
 [Audio]
 SAMPLE_RATE = 48000
-# Bytes per frame (s16le: 2 bytes/sample). Lower = less latency, coarser FFT.
-# 512 = 256 samples ≈ 5.3 ms   256 = 128 samples ≈ 2.7 ms   1024 = 512 samples ≈ 10.7 ms
+# Bytes per frame (s16le: 2 bytes/sample). Lower = less latency, no effect on FFT resolution.
+# 512 = 256 samples ~ 5.3 ms   256 = 128 samples ~ 2.7 ms   1024 = 512 samples ~ 10.7 ms
 CHUNK_BYTES = 512
-gain = 2.0
+# Overall sensitivity trim. With AGC on it scales the AGC target; raise for brighter effects.
+GAIN = 1.0
+
+# --- Frequency path (16 GEQ bands) ---
+# Channels + pink-noise balance match WLED's usermod, so the bars aren't all bass.
+FFT_WINDOW_SAMPLES = 1024
+BAND_AGC_DECAY = 0.997
+BAND_GAMMA = 0.4
+# Fold the lowest N bands into bin 0 so single-bin effects (e.g. PS Sonic Boom on bin 0) catch
+# bass no matter where a track's low fundamental sits. 0 = off; ~6 covers the full bass range.
+BASS_FOLD = 6
+
+# --- Volume path (drives volume-reactive effects) ---
+# AGC slowly adapts gain so the average loudness sits at AGC_TARGET; beats poke above it.
+AGC_ENABLED = true
+AGC_TARGET = 90
+AGC_SPEED = 0.02
+AGC_MAX_GAIN = 2000
+# Below this raw mean-abs level, output is silenced (kills idle flicker).
+SQUELCH = 40
+SMTH_ALPHA = 0.35
+
+# --- Beat detection (samplePeak flag) ---
+BEAT_THRESHOLD_MULT = 1.4
+BEAT_REFRACTORY_MS = 120
+
+[Web]
+enabled = false
+host = 127.0.0.1
+port = 8080
