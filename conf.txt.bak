@@ -15,17 +15,13 @@ GAIN = 1.0
 FFT_WINDOW_SAMPLES = 1024
 BAND_AGC_DECAY = 0.997
 BAND_GAMMA = 0.4
-# Transient boost: makes kicks pop above sustained tones so threshold beat-effects (e.g. PS Sonic
-# Boom) fire reliably even on high-sustain songs, without needing a higher (sparser) gamma.
-# 0 = off; ~1.5-2.5 = punchy. Keeps sustained tones visible, so GEQ display effects are unaffected.
-BAND_ATTACK = 1.5
 # Fold the lowest N bands into bin 0 so single-bin effects (e.g. PS Sonic Boom on bin 0) catch
 # bass no matter where a track's low fundamental sits. 0 = off; ~6 covers the full bass range.
 BASS_FOLD = 5
-BASS_FOLD_ONSET = 1
 
 # --- Volume path (drives volume-reactive effects) ---
 # AGC slowly adapts gain so the average loudness sits at AGC_TARGET; beats poke above it.
+AGC_ENABLED = true
 AGC_TARGET = 90
 AGC_SPEED = 0.02
 AGC_MAX_GAIN = 2000
@@ -36,13 +32,6 @@ SMTH_ALPHA = 0.35
 # --- Beat detection (samplePeak flag) ---
 BEAT_THRESHOLD_MULT = 1.4
 BEAT_REFRACTORY_MS = 120
-
-# --- Output ---
-# WLED renders ~43fps; ~90 packets/s keeps its data fresh at ~half the traffic.
-SEND_HZ = 90
-# Stop sending after this many seconds of silence (WLED holds the last zeroed frame = off);
-# resumes instantly on audio. The hold prevents cutting out during quiet passages.
-SILENCE_HOLD_SEC = 3
 
 [Web]
 enabled = true
