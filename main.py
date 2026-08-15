@@ -38,6 +38,13 @@ def audio(key, fallback):
 
 WLED_IP = config.get("WLED", "WLED_IP")
 WLED_PORT = config.getint("WLED", "WLED_PORT")
+# HTTP JSON API timeout for the (off-thread) presence check + settings sync.
+HTTP_TIMEOUT = config.getfloat("WLED", "HTTP_TIMEOUT", fallback=0.6)
+# CONTINUOUS_SEND: stream UDP whenever audio plays without caring whether WLED answers (good for
+# one-directional / receive-only rigs). When false we still send immediately at startup (assume the
+# strip is there) but pause once it's been unreachable for PRESENCE_GRACE_SEC, resuming when it returns.
+CONTINUOUS_SEND = config.getboolean("WLED", "CONTINUOUS_SEND", fallback=False)
+PRESENCE_GRACE_SEC = config.getfloat("WLED", "PRESENCE_GRACE_SEC", fallback=6.0)
 
 SAMPLE_RATE = config.getint("Audio", "SAMPLE_RATE")
 CHUNK_BYTES = config.getint("Audio", "CHUNK_BYTES")   # bytes read per frame; controls latency only
@@ -224,9 +231,12 @@ class Viz:
 
 viz = Viz()
 
-# WLED renders each effect once per frame at ~42fps and reads whatever fftResult arrived last.
-# We analyse at ~187fps, so run the Sonic Boom sim on every Nth frame to match that cadence.
-SB_DECIMATE = max(1, round(23.0 / CHUNK_MSEC))
+# WLED renders each effect once per frame (~42fps) and reads whatever fftResult last arrived over
+# UDP. We stream at ~SEND_HZ, so the Sonic Boom sim ticks on the exact bins we send (the peak-held
+# acc_bins), decimated down to WLED's render cadence - see run_loopback().
+WLED_RENDER_FPS = 42.0
+SEND_FPS = (1000.0 / CHUNK_MSEC) / SEND_DECIMATE
+SB_SEND_DECIMATE = max(1, round(SEND_FPS / WLED_RENDER_FPS))
 
 
 class SonicBoom:
@@ -310,7 +320,7 @@ class SonicBoom:
 sonic = SonicBoom()
 
 # Frames/sec of the decimated (WLED-cadence) onset stream that feeds the tempo tracker.
-SB_FPS = 1000.0 / (CHUNK_MSEC * SB_DECIMATE)
+SB_FPS = SEND_FPS / SB_SEND_DECIMATE
 
 
 class TempoTracker:
@@ -396,16 +406,31 @@ class WledClient:
     """Polls WLED's JSON API so the panel can show what the strip is doing and, crucially, pull the
     live effect/intensity/bin/length back to drive the Sonic Boom preview from the real settings."""
 
-    def __init__(self, ip):
+    def __init__(self, ip, timeout):
         self.ip = ip
+        self.timeout = timeout
         self.online = False
+        self.polled = False        # has at least one poll attempt finished?
+        self.last_seen = None      # monotonic time of the last successful poll
         self.error = ""
         self.info = {}
         self.effects = []
         self.state = {}
 
-    def _get(self, path, timeout=0.6):
-        with urllib.request.urlopen(f"http://{self.ip}{path}", timeout=timeout) as r:
+    def reachable(self, grace):
+        """Cheap in-memory presence check for the send loop (no I/O - polling runs off-thread).
+        Assumes the strip is present until the first poll finishes, so startup never blocks on WLED
+        and the first packets go straight out; after that it must have answered within `grace`."""
+        if not self.polled:
+            return True
+        if self.online:
+            return True
+        if self.last_seen is None:      # polled but never reachable -> strip not found
+            return False
+        return (time.monotonic() - self.last_seen) < grace
+
+    def _get(self, path):
+        with urllib.request.urlopen(f"http://{self.ip}{path}", timeout=self.timeout) as r:
             return json.loads(r.read().decode())
 
     def poll(self):
@@ -418,10 +443,13 @@ class WledClient:
             else:
                 self.state = self._get("/json/state")
             self.online = True
+            self.last_seen = time.monotonic()
             self.error = ""
         except Exception as e:
             self.online = False
             self.error = str(e)
+        finally:
+            self.polled = True
 
     def active_seg(self):
         segs = self.state.get("seg", [])
@@ -446,6 +474,8 @@ class WledClient:
             "on": self.state.get("on"), "bri": self.state.get("bri"),
             "fx": fx, "effect": (name.split("@")[0] if name else None),
             "isSonicBoom": bool(name and name.startswith("PS Sonic Boom")),
+            # full segment slider set - sync_sonic() uses ix/c3/o2/len today; the rest (Color c1,
+            # Position c2, ...) are kept so a per-effect monitor can read them later.
             "seg": {"ix": seg.get("ix"), "c1": seg.get("c1"), "c2": seg.get("c2"),
                     "c3": seg.get("c3"), "o2": seg.get("o2"), "len": seg_len},
         }
@@ -461,7 +491,7 @@ class WledClient:
         )
 
 
-wled = WledClient(WLED_IP)
+wled = WledClient(WLED_IP, HTTP_TIMEOUT)
 
 SERVICE_UNIT = config.get("Web", "service", fallback="glowbird-protocol.service")
 
@@ -634,7 +664,9 @@ def build_conf_text():
     p = live.snapshot()
     g = lambda x: f"{x:g}"
     return (
-        f"[WLED]\nWLED_IP = {WLED_IP}\nWLED_PORT = {WLED_PORT}\n\n"
+        f"[WLED]\nWLED_IP = {WLED_IP}\nWLED_PORT = {WLED_PORT}\n"
+        f"HTTP_TIMEOUT = {g(HTTP_TIMEOUT)}\nCONTINUOUS_SEND = {str(CONTINUOUS_SEND).lower()}\n"
+        f"PRESENCE_GRACE_SEC = {g(PRESENCE_GRACE_SEC)}\n\n"
         f"[Audio]\nSAMPLE_RATE = {SAMPLE_RATE}\nCHUNK_BYTES = {CHUNK_BYTES}\n"
         f"GAIN = {g(p['GAIN'])}\n\n"
         f"FFT_WINDOW_SAMPLES = {FFT_WINDOW_SAMPLES}\n"
@@ -1004,7 +1036,6 @@ def start_web_panel():
     try:
         httpd = _ReuseTCPServer((WEB_HOST, WEB_PORT), _ParamPanelHandler)
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        threading.Thread(target=_wled_poll_loop, daemon=True).start()
         print(f"Live tuning panel: http://{WEB_HOST}:{WEB_PORT}/", flush=True)
     except Exception as e:
         print(f"Could not start web panel (continuing without it): {e}", flush=True)
@@ -1029,6 +1060,7 @@ def run_loopback():
         sys.exit(f"Error starting parec: {e}")
 
     frame = 0
+    sends = 0
     last_active = time.monotonic()
     acc_bins = np.zeros(NUM_BANDS, dtype=np.uint8)   # coalesce skipped frames so throttling never
     acc_raw, acc_beat = 0.0, 0                        # drops an onset (peak-hold bins, OR the beat)
@@ -1043,9 +1075,6 @@ def run_loopback():
         bars, raw_255, smth_255, beat, mag, freq = result
         viz.update(result)
         frame += 1
-        if frame % SB_DECIMATE == 0:
-            sonic.tick(bars)            # mirror the WLED effect at its render cadence
-            tempo.push(int(bars[0]))    # bin 0 onset envelope -> BPM
 
         np.maximum(acc_bins, bars, out=acc_bins)
         acc_raw = max(acc_raw, raw_255)
@@ -1055,10 +1084,20 @@ def run_loopback():
             last_active = now
 
         if frame % SEND_DECIMATE == 0:
-            if now - last_active < SILENCE_HOLD_SEC:   # else: stay silent, WLED holds last (off)
+            live_audio = now - last_active < SILENCE_HOLD_SEC   # else: stay silent, WLED holds last (off)
+            # Presence gate is a cheap flag read (HTTP polling is off-thread) that assumes the strip
+            # is there until proven otherwise, so this never adds startup latency to the send path.
+            strip_ok = CONTINUOUS_SEND or wled.reachable(PRESENCE_GRACE_SEC)
+            if live_audio and strip_ok:
                 packet = create_udp_packet(acc_bins, acc_raw, smth_255, acc_beat, mag, freq)
                 udp_socket.sendto(packet, (WLED_IP, WLED_PORT))
                 tx.add(len(packet))
+            # Mirror Sonic Boom + tempo on the exact bins WLED receives (peak-held acc_bins),
+            # decimated to its render cadence - so 'booms'/'on strip' match the real strip.
+            sends += 1
+            if sends % SB_SEND_DECIMATE == 0:
+                sonic.tick(acc_bins)
+                tempo.push(int(acc_bins[0]))
             acc_bins[:] = 0
             acc_raw, acc_beat = 0.0, 0
     proc.wait()
@@ -1076,6 +1115,14 @@ def main():
         start_web_panel()
     else:
         print("Live tuning panel disabled (set [Web] enabled = true in conf.txt to turn it on).")
+    # Poll WLED off-thread when the panel needs it, or when presence-gating drives the send loop.
+    if WEB_ENABLED or not CONTINUOUS_SEND:
+        threading.Thread(target=_wled_poll_loop, daemon=True).start()
+    if CONTINUOUS_SEND:
+        print("Send mode: continuous (streaming whenever audio plays; strip presence ignored).")
+    else:
+        print(f"Send mode: presence-gated (assume strip present at startup, pause after "
+              f"{PRESENCE_GRACE_SEC:g}s unreachable; HTTP timeout {HTTP_TIMEOUT:g}s).")
     print("Starting capture -> WLED ...")
     run_loopback()
 

@@ -1,6 +1,13 @@
 [WLED]
 WLED_IP = 10.16.111.2
 WLED_PORT = 11988
+# HTTP JSON API timeout (s) for the off-thread presence check + settings sync.
+HTTP_TIMEOUT = 0.6
+# true  = always stream UDP while audio plays, ignoring whether WLED is reachable (receive-only rigs).
+# false = assume the strip is present at startup and stream immediately, but pause once it's been
+#         unreachable for PRESENCE_GRACE_SEC seconds; resume the moment it answers again.
+CONTINUOUS_SEND = false
+PRESENCE_GRACE_SEC = 6
 
 [Audio]
 SAMPLE_RATE = 48000

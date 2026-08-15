@@ -1,13 +1,12 @@
-# Alle Dot-Files und Dot-Directories ignorieren
+# All dots
 .*
-# Ausnahme: .gitignore und .git
+
+# Besides git
 !.gitignore
 !.git/
 
-# HTML-Dateien ignorieren
+# Build/IDE Artifacts
 *.html
-
-# VSCode-Dateien ignorieren
 .vscode/
 *.code-workspace
-
+__pycache__/
