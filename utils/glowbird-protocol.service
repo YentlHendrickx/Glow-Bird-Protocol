@@ -1,0 +1,16 @@
+[Unit]
+Description=WLED Audio Reactive Visualizer
+After=pipewire-pulse.service
+Wants=pipewire-pulse.service
+
+[Service]
+Type=simple
+# Point these at your checkout. main.py resolves conf.txt/presets relative to itself,
+# so WorkingDirectory is optional, but harmless to set.
+WorkingDirectory=/path/to/audio_responsive/src
+ExecStart=/usr/bin/python3 /path/to/audio_responsive/src/main.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

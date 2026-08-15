@@ -26,6 +26,17 @@ required.
   live slider, presets, a WLED status readout, and a server-side **PS Sonic
   Boom** beat-detection preview — all applied in memory without a restart.
 
+## 📁 Layout
+
+```
+src/     main.py, conf.txt, requirements.txt, presets/
+utils/   preset.sh, manage-service.sh, glowbird-protocol.service (example unit)
+.env     GLOWBIRD_SERVICE_NAME=... (systemd unit name for the util scripts)
+```
+
+`main.py` resolves `conf.txt` and `presets/` relative to itself, so you can launch
+it from any working directory.
+
 ## 🚀 Quick start
 
 ### 1. Requirements
@@ -38,12 +49,12 @@ sudo pacman -S libpulse
 # Debian/Ubuntu
 sudo apt install pulseaudio-utils
 
-pip install -r requirements.txt
+pip install -r src/requirements.txt
 ```
 
 ### 2. Configure
 
-Edit `conf.txt` — at minimum, point it at your device:
+Edit `src/conf.txt` — at minimum, point it at your device:
 
 ```ini
 [WLED]
@@ -68,7 +79,7 @@ the band balance, AGC, beat detection, and send rate.
 ### 3. Run
 
 ```bash
-python main.py
+python src/main.py
 ```
 
 With `[Web] enabled = true`, open <http://127.0.0.1:8080/> for the live monitor
@@ -77,12 +88,12 @@ and tuning panel.
 ## 🎛 Presets
 
 Tune parameters live in the web panel, then save them. Presets are `conf.txt`
-snapshots under `presets/`.
+snapshots under `src/presets/`.
 
 ```bash
-./preset.sh list          # list saved presets
-./preset.sh save <name>   # snapshot the current conf.txt
-./preset.sh use <name>    # make it the boot default and restart the service
+utils/preset.sh list          # list saved presets
+utils/preset.sh save <name>   # snapshot the current conf.txt
+utils/preset.sh use <name>    # make it the boot default and restart the service
 ```
 
 The web panel can also **Save** and **Load** presets — loading applies them
@@ -90,15 +101,27 @@ instantly; `preset.sh use` sets the one that survives a restart.
 
 ## 🔧 Run as a service
 
-`glowbird-protocol.service` is a user systemd unit. Edit `WorkingDirectory` and
-`ExecStart` to your checkout path, then:
+The unit name lives in `.env` (shared by the util scripts):
 
 ```bash
-cp glowbird-protocol.service ~/.config/systemd/user/
+echo 'GLOWBIRD_SERVICE_NAME=glowbird-protocol' > .env
+```
+
+`utils/glowbird-protocol.service` is an example user unit — edit its
+`WorkingDirectory`/`ExecStart` to your checkout, then install and enable it:
+
+```bash
+cp utils/glowbird-protocol.service ~/.config/systemd/user/
 systemctl --user enable --now glowbird-protocol.service
 ```
 
-The web panel can show the service status and restart it for you.
+Once installed, drive it with the manager script (reads `.env`):
+
+```bash
+utils/manage-service.sh {start|stop|restart|status|status_watch}
+```
+
+The web panel can also show the service status and restart it for you.
 
 ## 🛠 How it works
 

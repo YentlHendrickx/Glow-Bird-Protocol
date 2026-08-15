@@ -23,8 +23,11 @@ import numpy as np
 #   - fftResult[16]          : 16 GEQ bands that drive the "frequency" effects.
 # So both paths are auto-gained separately below. Optional live-tuning web panel via [Web].
 
+# conf.txt and presets/ live next to this script (src/), so resolve them relative to it rather than
+# the CWD - lets the service and the util scripts launch it from anywhere.
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 config = configparser.ConfigParser()
-config.read("conf.txt")
+config.read(os.path.join(_BASE_DIR, "conf.txt"))
 
 
 def audio(key, fallback):
@@ -116,7 +119,7 @@ SILENCE_HOLD_SEC = audio("SILENCE_HOLD_SEC", 3.0)
 WEB_ENABLED = config.getboolean("Web", "enabled", fallback=False)
 WEB_HOST = config.get("Web", "host", fallback="127.0.0.1")
 WEB_PORT = config.getint("Web", "port", fallback=8080)
-PRESETS_DIR = "presets"
+PRESETS_DIR = os.path.join(_BASE_DIR, "presets")
 
 if FFT_WINDOW_SAMPLES < CHUNK_SAMPLES:
     sys.exit("FFT_WINDOW_SAMPLES must be >= CHUNK_BYTES/2 (one read chunk).")
@@ -926,7 +929,7 @@ class _ParamPanelHandler(http.server.BaseHTTPRequestHandler):
             "<input type='text' name='name' placeholder='preset name' pattern='[A-Za-z0-9_-]+' required>"
             "<button type='submit'>Save current</button></form>"
             "<p class='note'>Load applies a preset live. To set the boot default, run "
-            "<code>./preset.sh use NAME</code> then restart the service.</p></div>"
+            "<code>utils/preset.sh use NAME</code> then restart the service.</p></div>"
             # ---- Service ----
             "<div class='card'><h2>Service <span class='pill' id='svcpill'>?</span></h2>"
             "<div class='bar-actions'><button type='button' id='svcbtn' class='mini'>Get status</button>"

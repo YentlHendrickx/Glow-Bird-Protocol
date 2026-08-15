@@ -13,9 +13,10 @@ fi
 
 key="GLOWBIRD_SERVICE_NAME"
 
-# If local .env, load it
-if [ -f .env ]; then
-    export $(cat .env | xargs)
+# Load .env from the repo root (one level up from utils/), regardless of CWD.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [ -f "$ROOT/.env" ]; then
+    export $(grep -v '^#' "$ROOT/.env" | xargs)
 fi
 
 if [ -z "${!key}" ]; then
