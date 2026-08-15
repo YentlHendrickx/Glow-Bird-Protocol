@@ -169,24 +169,53 @@ live = LiveParams(
     WHITEN_FLOOR=WHITEN_FLOOR,
 )
 
-# (key, label, step, min, max) - drives both the HTML form and clamping of submitted values.
-# FFT window / band edges aren't here: changing them resizes precomputed arrays, which needs a restart.
+# (key, label, step, min, max, help) - drives the HTML form, clamping of submitted values, and the
+# per-knob help text shown in the panel. FFT window / band edges aren't here: changing them resizes
+# precomputed arrays, which needs a restart.
 _PARAM_SPEC = [
-    ("GAIN", "Gain", 0.1, 0.1, 10.0),
-    ("SQUELCH", "Squelch (raw noise floor)", 1, 0, 2000),
-    ("AGC_TARGET", "AGC target level (0-255)", 5, 10, 240),
-    ("AGC_SPEED", "AGC speed", 0.001, 0.001, 0.5),
-    ("AGC_MAX_GAIN", "AGC max gain", 50, 100, 5000),
-    ("BAND_AGC_DECAY", "Band AGC decay", 0.0005, 0.9, 0.999999),
-    ("BAND_GAMMA", "Band gamma (<1 = fuller)", 0.05, 0.2, 1.5),
-    ("BAND_ATTACK", "Beat attack (transient boost)", 0.1, 0.0, 4.0),
-    ("BASS_FOLD", "Fold N low bands into bin 0 (0=off)", 1, 0, 16),
-    ("BASS_FOLD_ONSET", "Fold onsets not levels (0/1)", 1, 0, 1),
-    ("FOLD_WHITEN", "Adaptive whitening in fold (0/1)", 1, 0, 1),
-    ("WHITEN_FLOOR", "Whitening floor", 0.01, 0.01, 0.5),
-    ("SMTH_ALPHA", "Smoothing alpha", 0.01, 0.01, 1.0),
-    ("BEAT_THRESHOLD_MULT", "Beat threshold mult", 0.05, 1.0, 5.0),
-    ("BEAT_REFRACTORY_MS", "Beat refractory (ms)", 5, 0, 1000),
+    ("GAIN", "Gain", 0.1, 0.1, 10.0,
+     "Overall sensitivity trim; scales the volume AGC target and the band bars. Raise for brighter "
+     "output, but too high clips."),
+    ("SQUELCH", "Squelch (raw noise floor)", 1, 0, 2000,
+     "Noise gate on raw level: below this, everything outputs 0. Raise to stop idle hiss triggering "
+     "effects; lower to catch very quiet audio."),
+    ("AGC_TARGET", "AGC target level (0-255)", 5, 10, 240,
+     "Volume path only. Average loudness (0-255) the auto-gain chases; beats poke above it. Higher = "
+     "brighter volume-reactive effects. Sonic Boom ignores this."),
+    ("AGC_SPEED", "AGC speed", 0.001, 0.001, 0.5,
+     "How fast the volume auto-gain adapts each frame. Higher = snappier level tracking but more "
+     "pumping. Volume effects only."),
+    ("AGC_MAX_GAIN", "AGC max gain", 50, 100, 5000,
+     "Ceiling on the volume auto-gain so near-silence isn't amplified into noise. Volume effects only."),
+    ("BAND_AGC_DECAY", "Band AGC decay", 0.0005, 0.9, 0.999999,
+     "How fast the spectrum's auto-scale ceiling falls each frame. Near 1 = steady bar heights; lower "
+     "= snappier but more pumping between loud and quiet passages."),
+    ("BAND_GAMMA", "Band gamma (below 1 = fuller)", 0.05, 0.2, 1.5,
+     "Band contrast. Below 1 fills bars and lifts peaks (more Sonic Boom particles with onset-fold "
+     "on); higher = sparser, with more separation between real beats and quiet 'grass'."),
+    ("BAND_ATTACK", "Beat attack (transient boost)", 0.1, 0.0, 4.0,
+     "Transient boost: emphasises energy rising above each band's slow baseline, so kicks pop above "
+     "sustained tones. The main knob for separating real hits from drone. 0 = off."),
+    ("BASS_FOLD", "Fold N low bands into bin 0 (0=off)", 1, 0, 16,
+     "Fold the lowest N bands into bin 0 so single-bin effects (PS Sonic Boom on bin 0) catch bass "
+     "wherever it sits. 0 = off, 16 = whole spectrum."),
+    ("BASS_FOLD_ONSET", "Fold onsets not levels (0/1)", 1, 0, 1,
+     "How the fold fills bin 0: 1 = onsets (spikes on attack, drops to ~0 between hits, best for beat "
+     "effects), 0 = levels (steady presence)."),
+    ("FOLD_WHITEN", "Adaptive whitening in fold (0/1)", 1, 0, 1,
+     "In the onset fold, normalise each band by its recent peak so beats in quieter bands still "
+     "register (genre-robust). Catches more, but can over-sense; the whitening floor tames it."),
+    ("WHITEN_FLOOR", "Whitening floor", 0.01, 0.01, 0.5,
+     "Floor for whitening so near-silent bins don't amplify into noise. Raise to calm over-sensing "
+     "when whitening is on."),
+    ("SMTH_ALPHA", "Smoothing alpha", 0.01, 0.01, 1.0,
+     "Smoothing (EMA) for the smoothed volume value. Higher = snappier, lower = smoother/fluid. "
+     "Volume effects only."),
+    ("BEAT_THRESHOLD_MULT", "Beat threshold mult", 0.05, 1.0, 5.0,
+     "samplePeak beat flag fires when the level beats this multiple of the recent median. Higher = "
+     "only strong hits. Drives other beat effects - NOT used by Sonic Boom."),
+    ("BEAT_REFRACTORY_MS", "Beat refractory (ms)", 5, 0, 1000,
+     "Minimum gap between samplePeak beats so one hit can't retrigger. NOT used by Sonic Boom."),
 ]
 
 # Grouping for the web panel so the knobs aren't one long list.
@@ -197,7 +226,7 @@ _PARAM_GROUPS = [
     ("Volume", ["AGC_TARGET", "AGC_SPEED", "AGC_MAX_GAIN", "SMTH_ALPHA"]),
     ("Beat (samplePeak)", ["BEAT_THRESHOLD_MULT", "BEAT_REFRACTORY_MS"]),
 ]
-_SPEC_BY_KEY = {k: (k, label, step, lo, hi) for k, label, step, lo, hi in _PARAM_SPEC}
+_SPEC_BY_KEY = {s[0]: s for s in _PARAM_SPEC}
 
 class Viz:
     """Latest analysis frame, published by the audio thread for the web monitor. No lock needed:
@@ -698,7 +727,7 @@ def load_preset(name):
     cp = configparser.ConfigParser()
     if not cp.read(os.path.join(PRESETS_DIR, name + ".conf")):
         return
-    for key, _label, _step, lo, hi in _PARAM_SPEC:
+    for key, _label, _step, lo, hi, _desc in _PARAM_SPEC:
         if cp.has_option("Audio", key):
             try:
                 live.set(key, min(max(cp.getfloat("Audio", key), lo), hi))
@@ -716,6 +745,8 @@ h1{font-size:18px;font-weight:600;margin:0 0 2px}
 .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.05em;color:#8b93a1;margin:0 0 12px;font-weight:600}
 .row{display:grid;grid-template-columns:1fr 1.6fr 76px;gap:12px;align-items:center;margin:9px 0}
 .row label{color:#c3c9d4}
+.param{margin:0 0 11px}.param .row{margin:5px 0 0}
+.hint{color:#7a8290;font-size:11px;line-height:1.35;margin:3px 0 0}
 input[type=range]{width:100%;accent-color:#5b8cff}
 input[type=number],.save input{background:#0f1115;border:1px solid #2a2f3a;color:#e6e8ec;border-radius:6px;padding:6px 8px;font:inherit}
 input[type=number]{width:100%;text-align:right}
@@ -822,6 +853,8 @@ async function tick(){
   if(boomFlash>0)boomFlash--;
   renderWled(d.wled);
   if(d.tx){$('txpps').textContent=d.tx.pps;$('txkb').textContent=d.tx.kbps;}
+  if(d.send){$('sendmode').textContent=d.send.continuous?'continuous send'
+    :(d.send.gatedOff?'paused - strip unreachable':'presence-gated');}
 }
 async function svcStatus(){
   $('svcout').textContent='...';
@@ -857,13 +890,14 @@ class _ParamPanelHandler(http.server.BaseHTTPRequestHandler):
         values = live.snapshot()
 
         def row(key):
-            k, label, step, lo, hi = _SPEC_BY_KEY[key]
+            k, label, step, lo, hi, desc = _SPEC_BY_KEY[key]
             v = f"{values[k]:g}"
-            return (f'<div class="row"><label>{label}</label>'
+            return (f'<div class="param"><div class="row"><label>{label}</label>'
                     f'<input type="range" min="{lo}" max="{hi}" step="{step}" value="{v}" '
                     f'oninput="this.nextElementSibling.value=this.value">'
                     f'<input type="number" name="{k}" min="{lo}" max="{hi}" step="{step}" value="{v}" '
-                    f'oninput="this.previousElementSibling.value=this.value"></div>')
+                    f'oninput="this.previousElementSibling.value=this.value"></div>'
+                    f'<div class="hint">{desc}</div></div>')
 
         groups = "".join(
             f"<div class='group'><h3>{gname}</h3>" + "".join(row(k) for k in keys) + "</div>"
@@ -913,14 +947,15 @@ class _ParamPanelHandler(http.server.BaseHTTPRequestHandler):
             "<div class='card'><h2>WLED</h2><div id='wledbox' class='wled'>"
             "<div class='kv'><div class='k'>WLED</div><div class='v'>connecting...</div></div></div>"
             f"<p class='note'>Sending <b id='txpps'>0</b> pkt/s &middot; <b id='txkb'>0</b> KB/s "
-            f"&rarr; {WLED_IP}:{WLED_PORT}</p></div>"
+            f"&rarr; {WLED_IP}:{WLED_PORT} &middot; <b id='sendmode'>-</b></p></div>"
             # ---- Parameters (grouped) ----
             "<form method='POST' action='/update'><div class='card'><h2>Parameters</h2>"
             f"<div class='groups'>{groups}</div>"
             "<div class='actions'><button type='submit'>Apply</button></div>"
             f"<p class='note'>Startup only (edit conf.txt + restart): sample rate {SAMPLE_RATE} Hz &middot; "
             f"chunk {CHUNK_BYTES} B (~{CHUNK_MSEC:.1f} ms) &middot; FFT window {FFT_WINDOW_SAMPLES} samples &middot; "
-            f"send {SEND_HZ:g}/s &middot; silence stop {SILENCE_HOLD_SEC:g} s</p>"
+            f"send {SEND_HZ:g}/s &middot; silence stop {SILENCE_HOLD_SEC:g} s &middot; "
+            f"{'continuous send' if CONTINUOUS_SEND else f'presence-gated (grace {PRESENCE_GRACE_SEC:g} s, HTTP timeout {HTTP_TIMEOUT:g} s)'}</p>"
             "</div></form>"
             # ---- Presets ----
             "<div class='card'><h2>Presets</h2>"
@@ -961,8 +996,10 @@ class _ParamPanelHandler(http.server.BaseHTTPRequestHandler):
             self._send(self._render_page().encode("utf-8"), "text/html; charset=utf-8")
         elif parts.path == "/data":
             tx_pps, tx_kbps = tx.current()
+            gated_off = not CONTINUOUS_SEND and not wled.reachable(PRESENCE_GRACE_SEC)
             payload = {**viz.data(), "sb": sonic.state(), "wled": wled.summary(), "tempo": tempo.bpm,
-                       "tx": {"pps": tx_pps, "kbps": tx_kbps}}
+                       "tx": {"pps": tx_pps, "kbps": tx_kbps},
+                       "send": {"continuous": CONTINUOUS_SEND, "gatedOff": gated_off}}
             self._send(json.dumps(payload).encode("utf-8"), "application/json")
         elif parts.path == "/sbconfig":
             f = urllib.parse.parse_qs(parts.query)
@@ -980,7 +1017,7 @@ class _ParamPanelHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if self.path == "/update":
             form = self._read_form()
-            for key, _label, _step, lo, hi in _PARAM_SPEC:
+            for key, _label, _step, lo, hi, _desc in _PARAM_SPEC:
                 if key in form:
                     try:
                         live.set(key, min(max(float(form[key][0]), lo), hi))
