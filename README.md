@@ -31,6 +31,7 @@ required.
 ```
 src/     main.py, conf.txt, requirements.txt, presets/
 utils/   preset.sh, manage-service.sh, glowbird-protocol.service (example unit)
+tools/   replay_eval.py (offline replay + beat scoring; needs ffmpeg)
 .env     GLOWBIRD_SERVICE_NAME=... (systemd unit name for the util scripts)
 ```
 
@@ -98,6 +99,41 @@ utils/preset.sh use <name>    # make it the boot default and restart the service
 
 The web panel can also **Save** and **Load** presets — loading applies them
 instantly; `preset.sh use` sets the one that survives a restart.
+
+## 🥁 Beat pulse (PS Sonic Boom)
+
+With `BEAT_MODE = 1` (the default in `conf.txt` and the `sonicboom` preset) beats
+are detected here rather than by the effect's own threshold: a log-spectral-flux
+onset detector picks the beats and bin 0 gets a clean pulse — full height for
+`PULSE_MS`, then 0. WLED's edge detector then fires exactly once per beat and
+re-arms in between, and since the detector works on dB changes it behaves the
+same on quiet and loud, sparse and dense tracks. It also drives `samplePeak`.
+`BEAT_MODE = 0` restores the legacy band/fold behaviour for bin 0.
+
+On top of that, a **tempo lock** (`TEMPO_FILL`, `TEMPO_GATE`) tracks the tempo
+and where the beat falls. Once it's locked on a steady beat, it fills in beats
+that had no audible hit and drops hits that land off the grid
+(`TEMPO_GATE = 1` keeps beats + half-beats, `2` keeps beats only for a calmer
+look). When the music stops being steady, the lock fades out within about a
+bar and everything passes through again.
+
+## 📏 Measuring changes (replay harness)
+
+`tools/replay_eval.py` replays songs (anything `ffmpeg` decodes) through the
+exact live pipeline plus the server-side Sonic Boom mirror, and scores the booms
+against reference beats from an offline beat tracker — so a tweak gets judged
+over a whole library, not by ear on one song.
+
+```bash
+tools/replay_eval.py ~/Music                              # score src/conf.txt
+tools/replay_eval.py ~/Music -c conf -c conf:BEAT_MODE=0  # compare configs
+tools/replay_eval.py ~/Music -c conf:ONSET_THRESH=2.5,PULSE_MS=30 --json out.json
+```
+
+Headline metrics: **R** (reference beats that got a boom), **P8** (booms that
+landed on a beat or half-beat), **F8** (both combined) and the 10th-percentile
+F8 across songs. If the tracker gets a song's beats wrong, drop a
+`<song>.beats` file (one time in seconds per line) next to it.
 
 ## 🔧 Run as a service
 

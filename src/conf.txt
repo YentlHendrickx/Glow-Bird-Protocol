@@ -34,6 +34,23 @@ BAND_ATTACK = 1.5
 BASS_FOLD = 5
 BASS_FOLD_ONSET = 1
 
+# --- Beat pulse (bin 0) --- detect beats here and send bin 0 as a clean pulse: full height for
+# PULSE_MS, then 0. Level-invariant (log spectral flux), so it holds up across songs without retuning;
+# tuned with tools/replay_eval.py over a mixed library. Replaces bin 0 (and samplePeak) for every
+# effect, and the BASS_FOLD* keys above are ignored while it's on. 0 = legacy bin 0.
+BEAT_MODE = 1
+ONSET_THRESH = 3
+ONSET_RELPEAK = 0.3
+ONSET_MIN_IOI_MS = 100
+PULSE_MS = 40
+PULSE_DYNAMICS = 0.3
+# Tempo lock: once a steady beat is locked, fill beats with no audible hit and drop off-grid hits.
+# TEMPO_GATE 1 = keep beats + half-beats (best overall score); 2 = beats only (~25% fewer booms,
+# calmest look, slightly more misses). 0/0 = plain pulse detector.
+TEMPO_FILL = 1
+TEMPO_GATE = 1
+TEMPO_CONF = 0.6
+
 # --- Volume path (drives volume-reactive effects) ---
 # AGC slowly adapts gain so the average loudness sits at AGC_TARGET; beats poke above it.
 AGC_TARGET = 90

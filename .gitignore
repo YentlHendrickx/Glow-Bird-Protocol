@@ -10,3 +10,6 @@
 .vscode/
 *.code-workspace
 __pycache__/
+
+# Replay harness: reference-beat cache
+tools/cache/

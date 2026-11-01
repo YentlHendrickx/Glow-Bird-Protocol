@@ -90,6 +90,24 @@ BASS_FOLD_ONSET = audio("BASS_FOLD_ONSET", 0)
 # recent peak so a beat carried by a quiet band still registers, without retuning per song. 0/1.
 FOLD_WHITEN = audio("FOLD_WHITEN", 0)
 
+# Beat pulse (BEAT_MODE = 1): detect beats here and hand bin 0 a clean pulse - full-height for
+# PULSE_MS, then 0 - instead of a raw onset level for the effect to threshold itself. Detection is a
+# log-spectral-flux onset function, so it's level-invariant (no per-song gain balance to tune), and
+# the pulse shape guarantees WLED's edge detector fires exactly once per beat and re-arms in between.
+# samplePeak follows the same detector. 0 = legacy (bin 0 per BASS_FOLD* above).
+BEAT_MODE = audio("BEAT_MODE", 0)
+ONSET_THRESH = audio("ONSET_THRESH", 3.0)      # onset must beat this multiple of its ~1.5s running mean
+ONSET_RELPEAK = audio("ONSET_RELPEAK", 0.3)    # ...and this fraction of the recent (~2s) strongest onset
+ONSET_MIN_IOI_MS = audio("ONSET_MIN_IOI_MS", 100.0)   # minimum gap between beats (see its help)
+PULSE_MS = audio("PULSE_MS", 40.0)             # pulse length; >= 2 WLED frames (~24ms each) so it's seen
+PULSE_DYNAMICS = audio("PULSE_DYNAMICS", 0.3)  # 0 = every pulse full height; 1 = height follows strength
+# Tempo lock on top of the beat pulse: once a steady beat is locked, TEMPO_FILL fires the predicted
+# beats that had no audible hit, and TEMPO_GATE drops off-grid hits (1 = keep beats + half-beats,
+# 2 = beats only) - fewer stray flashes. TEMPO_CONF = share of recent predictions that must have hit.
+TEMPO_FILL = audio("TEMPO_FILL", 0)
+TEMPO_GATE = audio("TEMPO_GATE", 0)
+TEMPO_CONF = audio("TEMPO_CONF", 0.6)
+
 # WLED's 16-channel frequency edges (Hz), pink-noise compensation and top-end damping, straight
 # from its audioreactive usermod. The weight boosts higher bands (which naturally carry far less
 # energy) so the spectrum looks balanced, exactly as WLED does before it fills fftResult.
@@ -143,6 +161,31 @@ _WHITEN_DECAY = math.exp(-CHUNK_MSEC / 2000.0)             # ~2s per-bin peak me
 WHITEN_FLOOR = audio("WHITEN_FLOOR", 0.08)                 # keep silent bins from whitening up into noise
 MEDIAN_WIN = max(8, int(700.0 / CHUNK_MSEC))               # ~0.7s window for the median beat threshold
 
+# Beat pulse onset function: ~3 log-spaced bands per octave (equal weight per octave, so the many
+# treble FFT bins don't drown out the kick), flux against the frame ~16ms back, peak-picked with a
+# short look-ahead (~11ms of added latency) so only a local maximum fires.
+ONSET_LAG = max(1, round(16.0 / CHUNK_MSEC))
+ONSET_PRE = max(1, round(50.0 / CHUNK_MSEC))               # local-max window before the candidate
+ONSET_POST = max(1, round(10.0 / CHUNK_MSEC))              # ...and after it (look-ahead = latency)
+ONSET_MEAN_ALPHA = 1 - math.exp(-CHUNK_MSEC / 1500.0)      # ~1.5s running mean of the onset function
+ONSET_PEAK_DECAY = math.exp(-CHUNK_MSEC / 2000.0)          # ~2s memory of the strongest recent onset
+ONSET_FLOOR = 1.0                                          # magnitude floor before log (keeps hiss flat)
+
+# Tempo lock (BeatTracker): autocorrelation tempo on the onset function decimated by TEMPO_DS, over
+# ~8s, re-estimated ~4x/s for 60-200 BPM (log-normal prior around 120 against octave flips). Beat
+# phase = peak of a ~4s decaying onset-vs-phase histogram; a beat counts as hit if an onset lands
+# within max(TEMPO_WIN_MIN, 12% of a beat); fills fire TEMPO_GRACE after a silent predicted beat.
+TEMPO_DS = 2
+TEMPO_BUF = int(8000.0 / (CHUNK_MSEC * TEMPO_DS))
+TEMPO_EVERY = max(1, int(250.0 / (CHUNK_MSEC * TEMPO_DS)))
+_TEMPO_LAGS = np.arange(int(60000.0 / (200 * CHUNK_MSEC * TEMPO_DS)), int(60000.0 / (60 * CHUNK_MSEC * TEMPO_DS)) + 1)
+_TEMPO_PRIOR = np.exp(-0.5 * np.log2((60000.0 / (_TEMPO_LAGS * CHUNK_MSEC * TEMPO_DS)) / 120.0) ** 2)
+TEMPO_PHASE_BINS = 32
+TEMPO_PHASE_DECAY = math.exp(-CHUNK_MSEC / 4000.0)        # ~4s of phase evidence
+TEMPO_WIN_MIN = 50.0 / CHUNK_MSEC
+TEMPO_GRACE = 25.0 / CHUNK_MSEC
+TEMPO_HISTORY = 8
+
 
 class LiveParams:
     """Thread-safe store for the knobs the web panel may change while running. The audio thread
@@ -178,6 +221,15 @@ live = LiveParams(
     BEAT_REFRACTORY_MS=BEAT_REFRACTORY_MS,
     AGC_MAX_GAIN=AGC_MAX_GAIN,
     WHITEN_FLOOR=WHITEN_FLOOR,
+    BEAT_MODE=BEAT_MODE,
+    ONSET_THRESH=ONSET_THRESH,
+    ONSET_RELPEAK=ONSET_RELPEAK,
+    ONSET_MIN_IOI_MS=ONSET_MIN_IOI_MS,
+    PULSE_MS=PULSE_MS,
+    PULSE_DYNAMICS=PULSE_DYNAMICS,
+    TEMPO_FILL=TEMPO_FILL,
+    TEMPO_GATE=TEMPO_GATE,
+    TEMPO_CONF=TEMPO_CONF,
 )
 
 # (key, label, step, min, max, help) - drives the HTML form, clamping of submitted values, and the
@@ -219,23 +271,50 @@ _PARAM_SPEC = [
     ("WHITEN_FLOOR", "Whitening floor", 0.01, 0.01, 0.5,
      "Floor for whitening so near-silent bins don't amplify into noise. Raise to calm over-sensing "
      "when whitening is on."),
+    ("BEAT_MODE", "Beat pulse on bin 0 (0/1)", 1, 0, 1,
+     "1 = detect beats here and send bin 0 as a clean pulse (best for PS Sonic Boom; ignores the fold "
+     "knobs). 0 = legacy: bin 0 from the band/fold settings. Also drives the samplePeak flag."),
+    ("ONSET_THRESH", "Onset threshold (x running mean)", 0.05, 1.0, 6.0,
+     "An onset must exceed this multiple of the onset strength's ~1.5s average. Higher = fewer, "
+     "stronger beats; lower = catches softer hits."),
+    ("ONSET_RELPEAK", "Onset vs recent peak (0-1)", 0.01, 0.0, 1.0,
+     "An onset must also reach this fraction of the strongest onset in the last ~2s, so hi-hats under a "
+     "kick don't fire. Lower = more hits; higher = only the dominant hits."),
+    ("ONSET_MIN_IOI_MS", "Min gap between beats (ms)", 5, 60, 600,
+     "Refractory between beats. Keep it short (~100 ms): a long one lets a 16th-note pickup block "
+     "the beat right after it. Raise only if rolls/flams double-fire."),
+    ("PULSE_MS", "Pulse length (ms)", 1, 10, 150,
+     "How long bin 0 stays up per beat. Must cover at least one WLED frame (~24 ms); 40 is safe."),
+    ("PULSE_DYNAMICS", "Pulse dynamics (0-1)", 0.05, 0.0, 1.0,
+     "0 = every beat a full-height pulse (most particles); 1 = pulse height follows hit strength."),
+    ("TEMPO_FILL", "Tempo lock: fill missed beats (0/1)", 1, 0, 1,
+     "Once a steady tempo is locked, fire the predicted beat when no hit is heard (soft or masked kicks). "
+     "Fades out on its own after about a bar without hits."),
+    ("TEMPO_GATE", "Tempo lock: drop off-grid hits (0-2)", 1, 0, 2,
+     "While locked: 0 = pass every hit, 1 = only beats and half-beats, 2 = only beats. Higher = calmer, "
+     "fewer stray flashes."),
+    ("TEMPO_CONF", "Tempo lock confidence (0-1)", 0.05, 0.3, 1.0,
+     "Share of the last 8 predicted beats that must have had a real hit to count as locked. Higher = "
+     "fills/gating only on very steady music."),
     ("SMTH_ALPHA", "Smoothing alpha", 0.01, 0.01, 1.0,
      "Smoothing (EMA) for the smoothed volume value. Higher = snappier, lower = smoother/fluid. "
      "Volume effects only."),
     ("BEAT_THRESHOLD_MULT", "Beat threshold mult", 0.05, 1.0, 5.0,
-     "samplePeak beat flag fires when the level beats this multiple of the recent median. Higher = "
-     "only strong hits. Drives other beat effects - NOT used by Sonic Boom."),
+     "Legacy samplePeak (BEAT_MODE 0 only): flag fires when the level beats this multiple of the recent "
+     "median. Higher = only strong hits. NOT used by Sonic Boom."),
     ("BEAT_REFRACTORY_MS", "Beat refractory (ms)", 5, 0, 1000,
-     "Minimum gap between samplePeak beats so one hit can't retrigger. NOT used by Sonic Boom."),
+     "Legacy samplePeak (BEAT_MODE 0 only): minimum gap between beats so one hit can't retrigger."),
 ]
 
 # Grouping for the web panel so the knobs aren't one long list.
 _PARAM_GROUPS = [
     ("General", ["GAIN", "SQUELCH"]),
+    ("Beat pulse (bin 0)", ["BEAT_MODE", "ONSET_THRESH", "ONSET_RELPEAK", "ONSET_MIN_IOI_MS",
+                            "PULSE_MS", "PULSE_DYNAMICS", "TEMPO_FILL", "TEMPO_GATE", "TEMPO_CONF"]),
     ("Frequency bands", ["BAND_GAMMA", "BAND_ATTACK", "BAND_AGC_DECAY",
                          "BASS_FOLD", "BASS_FOLD_ONSET", "FOLD_WHITEN", "WHITEN_FLOOR"]),
     ("Volume", ["AGC_TARGET", "AGC_SPEED", "AGC_MAX_GAIN", "SMTH_ALPHA"]),
-    ("Beat (samplePeak)", ["BEAT_THRESHOLD_MULT", "BEAT_REFRACTORY_MS"]),
+    ("Legacy beat (samplePeak)", ["BEAT_THRESHOLD_MULT", "BEAT_REFRACTORY_MS"]),
 ]
 _SPEC_BY_KEY = {s[0]: s for s in _PARAM_SPEC}
 
@@ -315,7 +394,9 @@ class SonicBoom:
         if strip_len is not None:
             self.strip_len = max(1, min(4000, strip_len))
 
-    def tick(self, bars):
+    def tick(self, bars, now=None):
+        """Advance one WLED frame. Returns the boom's particle span (>0) when it fires, else 0 - span
+        is what hw_random16() rolls over, so P(boom visible) = (span-1)/span."""
         b = self.bin
         loud = int(bars[b])
         if b > 12:
@@ -330,15 +411,17 @@ class SonicBoom:
             if self.armed:
                 self.armed = False
                 self.booms += 1
-                self._times.append(time.monotonic())
+                self._times.append(time.monotonic() if now is None else now)
                 self._times = self._times[-16:]
                 base = 4 + ((self.strip_len - 1) >> 2)   # explosionsize before randomisation
                 span = (base * loud) >> 10
                 self.particles = random.randrange(span) if span > 0 else 0  # hw_random16(span)
                 if self.particles > 0:
                     self.visible += 1
+                return max(span, 1)                      # still a boom even if it emits nothing
         else:
             self.armed = True
+        return 0
 
     def bpm(self):
         now = time.monotonic()
@@ -592,122 +675,270 @@ def service_restart():
 
 udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-# Precomputed analysis state
+# Precomputed analysis constants
 _hann = np.hanning(FFT_WINDOW_SAMPLES)
 _freqs = np.fft.rfftfreq(FFT_WINDOW_SAMPLES, d=1.0 / SAMPLE_RATE)
 _band_bin_edges = np.clip(np.searchsorted(_freqs, _WLED_BAND_EDGES_HZ), 0, len(_freqs) - 1)
-
-_rolling_buffer = np.zeros(FFT_WINDOW_SAMPLES, dtype=np.float64)
-_band_baseline = np.zeros(NUM_BANDS)   # slow per-band level, subtracted for transient emphasis
-_fold_peak = np.zeros(NUM_BANDS)       # per-band recent onset peak, for adaptive whitening
-_energy_ring = np.zeros(MEDIAN_WIN)    # recent raw levels, for the median beat threshold
-_ring_i = 0
-_band_agc_ref = 1.0
-_agc_gain = 1.0        # volume-path AGC multiplier
-_vol_avg = 1.0         # slow average of raw_level, the AGC control signal
-_smth_level = 0.0
-_beat_refractory = 0
+# Onset bands: 3 per octave from 40Hz, merged where the FFT is too coarse to split them.
+_onset_edges = np.unique(np.searchsorted(_freqs, 40.0 * 2 ** (np.arange(0, 28) / 3.0)))
+_onset_edges = _onset_edges[_onset_edges < len(_freqs)]
+_onset_counts = np.diff(_onset_edges)
 
 
-def compute_bands(p, gated):
-    """16 GEQ bands (0-254) using WLED's own channel split + pink-noise curve, then a global
-    linear auto-scale so the bars read like a spectrum analyser instead of a wall of bass."""
-    global _band_agc_ref, _band_baseline, _fold_peak
+class BeatTracker:
+    """Causal tempo + phase lock on the beat-pulse onset stream (frame-indexed, so live and replay
+    agree). Tempo: autocorrelation of the last ~8s of the onset function. Phase: a beat-phase
+    accumulator plus a decaying histogram of onset strength over phase - the beat sits where onsets
+    pile up, which picks the kick/snare grid over the off-beat hi-hats (anchoring on the first strong
+    onset locked half a beat out on many tracks). Each beat cycle is logged as hit (an onset landed on
+    it) or miss; while enough recent cycles hit, it can fill a silent beat (TEMPO_FILL) and drop
+    off-grid onsets (TEMPO_GATE). A fill counts as a miss, so in a breakdown the lock fades in ~a bar."""
 
-    windowed = _rolling_buffer * _hann          # Hann window cuts spectral leakage between bins
-    spectrum = np.abs(np.fft.rfft(windowed))
-    n_bins = len(spectrum)
+    def __init__(self):
+        self.buf = np.zeros(TEMPO_BUF)               # onset function, decimated by TEMPO_DS, oldest first
+        self._acc = 0.0
+        self._n = 0
+        self.period = 0.0                            # beat period in frames (0 = no tempo yet)
+        self.ph = 0.0                                # beat-phase accumulator, 0..1
+        self.hist = np.zeros(TEMPO_PHASE_BINS)       # onset strength by phase
+        self.beat_ph = 0.0                           # phase where the beat sits (histogram peak)
+        self.prev_d = 0.0
+        self.cycle_hit = False
+        self.filled = False
+        self.hits = []                               # recent beat cycles: 1 = onset landed, 0 = not
 
-    band_energy = np.empty(NUM_BANDS)
-    for i in range(NUM_BANDS):
-        lo = int(_band_bin_edges[i])
-        hi = int(min(max(lo + 1, _band_bin_edges[i + 1]), n_bins))
-        band_energy[i] = np.mean(spectrum[lo:hi])
-    band_energy *= _BAND_WEIGHT                  # pink-noise compensation (lift highs, damp top two)
+    def locked(self, p):
+        return len(self.hits) >= 4 and sum(self.hits) / len(self.hits) >= p["TEMPO_CONF"]
 
-    _band_baseline += (band_energy - _band_baseline) * BASELINE_ALPHA
-    if p["BAND_ATTACK"] > 0:                     # push transients above the sustained floor
-        band_energy += p["BAND_ATTACK"] * np.maximum(band_energy - _band_baseline, 0)
+    def bpm(self):
+        return round(60000.0 / (self.period * CHUNK_MSEC)) if self.period else 0
 
-    if not gated:
-        _band_agc_ref = max(band_energy.max(), _band_agc_ref * p["BAND_AGC_DECAY"], 1e-6)
+    def _estimate(self):
+        x = self.buf - self.buf.mean()
+        if not np.any(x):
+            return
+        r = np.array([np.dot(x[lag:], x[:-lag]) for lag in _TEMPO_LAGS]) * _TEMPO_PRIOR
+        k = int(np.argmax(r))
+        if r[k] <= 0:
+            return
+        lag = float(_TEMPO_LAGS[k])
+        if 0 < k < len(r) - 1:                       # parabolic refinement between lags
+            a, b, c = r[k - 1], r[k], r[k + 1]
+            if a - 2 * b + c < 0:
+                lag += 0.5 * (a - c) / (a - 2 * b + c)
+        period = lag * TEMPO_DS
+        if not self.period or abs(period / self.period - 1) > 0.04:
+            if self.period:                          # real tempo change: old phase evidence is stale
+                self.hist[:] = 0
+                self.hits = []
+            self.period = period
+        else:                                        # small drift: follow it without a reset
+            self.period += 0.25 * (period - self.period)
 
-    norm = np.clip(band_energy / _band_agc_ref, 0, 1)
-    bars = (norm ** p["BAND_GAMMA"]) * 255 * p["GAIN"]   # gamma<1 fills the bars out
-    bars = np.where(gated, 0, np.clip(bars, 0, 254)).astype(np.uint8)
+    def step(self, odf, onset, p):
+        """One frame. -> (pass the detected onset on?, emit a filled beat?)"""
+        self._acc = max(self._acc, odf)
+        self._n += 1
+        if self._n % TEMPO_DS == 0:
+            self.buf[:-1] = self.buf[1:]
+            self.buf[-1] = self._acc
+            self._acc = 0.0
+            if self._n % (TEMPO_DS * TEMPO_EVERY) == 0:
+                self._estimate()
+                sm = self.hist + 0.5 * (np.roll(self.hist, 1) + np.roll(self.hist, -1))
+                self.beat_ph = (int(np.argmax(sm)) + 0.5) / TEMPO_PHASE_BINS
+        if not self.period:
+            return onset, False
 
-    fold = int(p["BASS_FOLD"])
-    if fold > 1:
-        if p["BASS_FOLD_ONSET"] > 0:
-            # Fold ONSETS (energy above each band's slow baseline), not levels: bin 0 fires on an
-            # attack in any folded band but falls back to ~0 between hits, so edge-triggered beat
-            # effects re-arm cleanly and don't skip at high BPM.
-            onset = np.clip(np.maximum(band_energy - _band_baseline, 0.0) / _band_agc_ref, 0, 1)
-            if p["FOLD_WHITEN"] > 0:
-                # normalise each band's onset by its own recent peak so a beat carried by a quiet
-                # band still registers (adaptive whitening); the floor keeps silent bins down.
-                _fold_peak = np.maximum(onset, np.maximum(p["WHITEN_FLOOR"], _WHITEN_DECAY * _fold_peak))
-                onset = onset / _fold_peak
-            ob = (onset[:fold] ** p["BAND_GAMMA"]) * 255 * p["GAIN"] * _FOLD_TILT[:fold]
-            bars[0] = 0 if gated else np.uint8(np.clip(ob.max(), 0, 254))
-        else:
-            bars[0] = bars[:fold].max()     # fold levels: bin 0 shows bass presence
+        self.ph = (self.ph + 1.0 / self.period) % 1.0
+        self.hist *= TEMPO_PHASE_DECAY
+        self.hist[int(self.ph * TEMPO_PHASE_BINS) % TEMPO_PHASE_BINS] += odf
 
-    peak_bin = int(np.argmax(spectrum[1:])) + 1   # skip DC so FFT_MajorPeak is never 0 Hz
-    return bars, float(_freqs[peak_bin]), float(spectrum[peak_bin])
-
-
-def compute_volume(raw_level, p, gated):
-    """Volume loudness (0-255) for sampleRaw, plus its smoothed EMA for sampleSmth."""
-    global _agc_gain, _vol_avg, _smth_level
-
-    if not gated:
-        _vol_avg += (raw_level - _vol_avg) * VOL_AVG_ALPHA
-        target_gain = (p["AGC_TARGET"] * p["GAIN"]) / max(_vol_avg, 1e-3)
-        _agc_gain += (target_gain - _agc_gain) * p["AGC_SPEED"]
-        _agc_gain = min(max(_agc_gain, 0.0), p["AGC_MAX_GAIN"])
-
-    raw_255 = 0.0 if gated else float(np.clip(raw_level * _agc_gain, 0, 255))
-    _smth_level = p["SMTH_ALPHA"] * raw_255 + (1 - p["SMTH_ALPHA"]) * _smth_level
-    return raw_255, _smth_level
-
-
-def detect_beat(raw_level, p, gated):
-    """Onset detector -> samplePeak flag: instant level vs. a MEDIAN of recent levels (robust to the
-    beat's own spike, unlike a mean), with a refractory gap so one hit doesn't retrigger."""
-    global _beat_refractory, _ring_i
-
-    _energy_ring[_ring_i] = raw_level
-    _ring_i = (_ring_i + 1) % MEDIAN_WIN
-    threshold = np.median(_energy_ring) * p["BEAT_THRESHOLD_MULT"]
-
-    if not gated and _beat_refractory == 0 and raw_level > threshold and raw_level > p["SQUELCH"]:
-        _beat_refractory = max(1, int(p["BEAT_REFRACTORY_MS"] / CHUNK_MSEC))
-        return 1
-    _beat_refractory = max(0, _beat_refractory - 1)
-    return 0
+        d = (self.ph - self.beat_ph + 0.5) % 1.0 - 0.5          # beats from the beat, -0.5..0.5
+        wb = max(TEMPO_WIN_MIN, 0.12 * self.period) / self.period
+        locked = self.locked(p)
+        passed, fill = onset, False
+        if onset:
+            if abs(d) <= wb:
+                self.cycle_hit = True
+            elif locked and p["TEMPO_GATE"] > 0:
+                passed = p["TEMPO_GATE"] < 2 and abs(abs(d) - 0.5) <= wb   # keep half-beats at 1
+        if (locked and p["TEMPO_FILL"] > 0 and not self.cycle_hit and not self.filled
+                and d >= TEMPO_GRACE / self.period and self.prev_d < TEMPO_GRACE / self.period):
+            fill = self.filled = True
+        if d > wb >= self.prev_d:                    # this beat's window just closed
+            self.hits = (self.hits + [1 if self.cycle_hit else 0])[-TEMPO_HISTORY:]
+            self.cycle_hit = self.filled = False
+        self.prev_d = d
+        return passed, fill
 
 
-def analyse(audio_chunk):
-    try:
-        p = live.snapshot()
-        new_samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float64)
-        n = len(new_samples)
+class Analyzer:
+    """All per-stream analysis state, so a live capture and an offline replay (tools/replay_eval.py)
+    run the exact same code - and a replay can start each song from a clean slate."""
 
-        # slide the analysis window and append the newest chunk (more FFT resolution, no extra latency)
-        _rolling_buffer[:-n] = _rolling_buffer[n:]
-        _rolling_buffer[-n:] = new_samples
+    def __init__(self):
+        self.rolling_buffer = np.zeros(FFT_WINDOW_SAMPLES, dtype=np.float64)
+        self.band_baseline = np.zeros(NUM_BANDS)   # slow per-band level, subtracted for transient emphasis
+        self.fold_peak = np.zeros(NUM_BANDS)       # per-band recent onset peak, for adaptive whitening
+        self.energy_ring = np.zeros(MEDIAN_WIN)    # recent raw levels, for the median beat threshold
+        self.ring_i = 0
+        self.band_agc_ref = 1.0
+        self.agc_gain = 1.0        # volume-path AGC multiplier
+        self.vol_avg = 1.0         # slow average of raw_level, the AGC control signal
+        self.smth_level = 0.0
+        self.beat_refractory = 0
+        # beat pulse detector
+        n_onset = len(_onset_counts)
+        self.log_hist = np.zeros((ONSET_LAG, n_onset))       # recent log band levels, oldest first
+        self.odf_win = np.zeros(ONSET_PRE + 1 + ONSET_POST)  # onset function around the candidate
+        self.odf_mean = 0.0
+        self.odf_peak = 0.0
+        self.since_beat = 1 << 30                            # frames since the last fired beat
+        self.pulse_left = 0
+        self.pulse_val = 0
+        self.tracker = BeatTracker()
 
-        raw_level = float(np.mean(np.abs(new_samples)))
-        gated = raw_level < p["SQUELCH"]
+    def compute_bands(self, p, gated):
+        """16 GEQ bands (0-254) using WLED's own channel split + pink-noise curve, then a global
+        linear auto-scale so the bars read like a spectrum analyser instead of a wall of bass."""
+        windowed = self.rolling_buffer * _hann      # Hann window cuts spectral leakage between bins
+        spectrum = np.abs(np.fft.rfft(windowed))
+        n_bins = len(spectrum)
 
-        bars, peak_freq, peak_mag = compute_bands(p, gated)
-        raw_255, smth_255 = compute_volume(raw_level, p, gated)
-        beat = detect_beat(raw_level, p, gated)
-        return bars, raw_255, smth_255, beat, peak_mag, peak_freq
-    except Exception as e:
-        print(f"Error analysing audio: {e}")
-        return None, 0, 0, 0, 0, 0
+        band_energy = np.empty(NUM_BANDS)
+        for i in range(NUM_BANDS):
+            lo = int(_band_bin_edges[i])
+            hi = int(min(max(lo + 1, _band_bin_edges[i + 1]), n_bins))
+            band_energy[i] = np.mean(spectrum[lo:hi])
+        band_energy *= _BAND_WEIGHT                  # pink-noise compensation (lift highs, damp top two)
+
+        self.band_baseline += (band_energy - self.band_baseline) * BASELINE_ALPHA
+        if p["BAND_ATTACK"] > 0:                     # push transients above the sustained floor
+            band_energy += p["BAND_ATTACK"] * np.maximum(band_energy - self.band_baseline, 0)
+
+        if not gated:
+            self.band_agc_ref = max(band_energy.max(), self.band_agc_ref * p["BAND_AGC_DECAY"], 1e-6)
+
+        norm = np.clip(band_energy / self.band_agc_ref, 0, 1)
+        bars = (norm ** p["BAND_GAMMA"]) * 255 * p["GAIN"]   # gamma<1 fills the bars out
+        bars = np.where(gated, 0, np.clip(bars, 0, 254)).astype(np.uint8)
+
+        fold = int(p["BASS_FOLD"])
+        if fold > 1:
+            if p["BASS_FOLD_ONSET"] > 0:
+                # Fold ONSETS (energy above each band's slow baseline), not levels: bin 0 fires on an
+                # attack in any folded band but falls back to ~0 between hits, so edge-triggered beat
+                # effects re-arm cleanly and don't skip at high BPM.
+                onset = np.clip(np.maximum(band_energy - self.band_baseline, 0.0) / self.band_agc_ref, 0, 1)
+                if p["FOLD_WHITEN"] > 0:
+                    # normalise each band's onset by its own recent peak so a beat carried by a quiet
+                    # band still registers (adaptive whitening); the floor keeps silent bins down.
+                    self.fold_peak = np.maximum(onset, np.maximum(p["WHITEN_FLOOR"], _WHITEN_DECAY * self.fold_peak))
+                    onset = onset / self.fold_peak
+                ob = (onset[:fold] ** p["BAND_GAMMA"]) * 255 * p["GAIN"] * _FOLD_TILT[:fold]
+                bars[0] = 0 if gated else np.uint8(np.clip(ob.max(), 0, 254))
+            else:
+                bars[0] = bars[:fold].max()     # fold levels: bin 0 shows bass presence
+
+        peak_bin = int(np.argmax(spectrum[1:])) + 1   # skip DC so FFT_MajorPeak is never 0 Hz
+        return bars, float(_freqs[peak_bin]), float(spectrum[peak_bin]), spectrum
+
+    def beat_pulse(self, spectrum, p, gated):
+        """Beat pulse detector -> (bin 0 value, beat flag). Onset function = mean over log-spaced bands
+        of the positive dB rise vs. ~16ms ago (max over neighbouring bands, SuperFlux-style, so vibrato
+        and slides don't count). A beat fires on a local maximum that clears both a running-mean and a
+        recent-peak threshold, then bin 0 holds a pulse for PULSE_MS and drops to 0."""
+        cs = np.concatenate(([0.0], np.cumsum(spectrum)))
+        band = (cs[_onset_edges[1:]] - cs[_onset_edges[:-1]]) / _onset_counts
+        level = 20.0 * np.log10(band + ONSET_FLOOR)
+        old = self.log_hist[0]
+        ref = np.maximum(old, np.maximum(np.roll(old, 1), np.roll(old, -1)))
+        odf = 0.0 if gated else float(np.mean(np.maximum(level - ref, 0.0)))
+        self.log_hist[:-1] = self.log_hist[1:]
+        self.log_hist[-1] = level
+
+        self.odf_win[:-1] = self.odf_win[1:]
+        self.odf_win[-1] = odf
+        cand = self.odf_win[ONSET_PRE]                       # judged ONSET_POST frames late
+        self.since_beat += 1
+
+        detected = (not gated and cand > 0 and cand >= self.odf_win.max()
+                    and cand > p["ONSET_THRESH"] * self.odf_mean
+                    and cand >= p["ONSET_RELPEAK"] * self.odf_peak)
+        rel = min(1.0, cand / max(self.odf_peak, cand, 1e-9))
+        fill = False
+        if p["TEMPO_FILL"] > 0 or p["TEMPO_GATE"] > 0:
+            detected, fill = self.tracker.step(0.0 if gated else cand, detected, p)
+            if fill:
+                rel = 0.5                                    # a predicted beat: mid-height pulse
+        beat = 0
+        if (detected or fill) and self.since_beat * CHUNK_MSEC >= p["ONSET_MIN_IOI_MS"]:
+            beat = 1
+            self.since_beat = 0
+            self.pulse_val = int(254 * (1 - p["PULSE_DYNAMICS"] * (1 - rel)))
+            self.pulse_left = max(1, round(p["PULSE_MS"] / CHUNK_MSEC))
+        if not gated:
+            self.odf_mean += (cand - self.odf_mean) * ONSET_MEAN_ALPHA
+        self.odf_peak = max(cand, self.odf_peak * ONSET_PEAK_DECAY)
+
+        if self.pulse_left > 0:
+            self.pulse_left -= 1
+            return self.pulse_val, beat
+        return 0, beat
+
+    def compute_volume(self, raw_level, p, gated):
+        """Volume loudness (0-255) for sampleRaw, plus its smoothed EMA for sampleSmth."""
+        if not gated:
+            self.vol_avg += (raw_level - self.vol_avg) * VOL_AVG_ALPHA
+            target_gain = (p["AGC_TARGET"] * p["GAIN"]) / max(self.vol_avg, 1e-3)
+            self.agc_gain += (target_gain - self.agc_gain) * p["AGC_SPEED"]
+            self.agc_gain = min(max(self.agc_gain, 0.0), p["AGC_MAX_GAIN"])
+
+        raw_255 = 0.0 if gated else float(np.clip(raw_level * self.agc_gain, 0, 255))
+        self.smth_level = p["SMTH_ALPHA"] * raw_255 + (1 - p["SMTH_ALPHA"]) * self.smth_level
+        return raw_255, self.smth_level
+
+    def detect_beat(self, raw_level, p, gated):
+        """Onset detector -> samplePeak flag: instant level vs. a MEDIAN of recent levels (robust to the
+        beat's own spike, unlike a mean), with a refractory gap so one hit doesn't retrigger."""
+        self.energy_ring[self.ring_i] = raw_level
+        self.ring_i = (self.ring_i + 1) % MEDIAN_WIN
+        threshold = np.median(self.energy_ring) * p["BEAT_THRESHOLD_MULT"]
+
+        if not gated and self.beat_refractory == 0 and raw_level > threshold and raw_level > p["SQUELCH"]:
+            self.beat_refractory = max(1, int(p["BEAT_REFRACTORY_MS"] / CHUNK_MSEC))
+            return 1
+        self.beat_refractory = max(0, self.beat_refractory - 1)
+        return 0
+
+    def analyse(self, audio_chunk, p=None):
+        try:
+            if p is None:
+                p = live.snapshot()
+            new_samples = np.frombuffer(audio_chunk, dtype=np.int16).astype(np.float64)
+            n = len(new_samples)
+
+            # slide the analysis window and append the newest chunk (more FFT resolution, no extra latency)
+            self.rolling_buffer[:-n] = self.rolling_buffer[n:]
+            self.rolling_buffer[-n:] = new_samples
+
+            raw_level = float(np.mean(np.abs(new_samples)))
+            gated = raw_level < p["SQUELCH"]
+
+            bars, peak_freq, peak_mag, spectrum = self.compute_bands(p, gated)
+            raw_255, smth_255 = self.compute_volume(raw_level, p, gated)
+            if p["BEAT_MODE"] > 0:
+                bars[0], beat = self.beat_pulse(spectrum, p, gated)
+            else:
+                beat = self.detect_beat(raw_level, p, gated)
+            return bars, raw_255, smth_255, beat, peak_mag, peak_freq
+        except Exception as e:
+            print(f"Error analysing audio: {e}")
+            return None, 0, 0, 0, 0, 0
+
+
+analyzer = Analyzer()
 
 
 def create_udp_packet(fft_values, raw_level, smoothed_level, peak_flag, fft_magnitude, fft_peak_frequency):
@@ -752,6 +983,11 @@ def build_conf_text():
         f"BAND_ATTACK = {g(p['BAND_ATTACK'])}\nBASS_FOLD = {int(p['BASS_FOLD'])}\n"
         f"BASS_FOLD_ONSET = {int(p['BASS_FOLD_ONSET'])}\nFOLD_WHITEN = {int(p['FOLD_WHITEN'])}\n"
         f"WHITEN_FLOOR = {g(p['WHITEN_FLOOR'])}\n\n"
+        f"BEAT_MODE = {int(p['BEAT_MODE'])}\nONSET_THRESH = {g(p['ONSET_THRESH'])}\n"
+        f"ONSET_RELPEAK = {g(p['ONSET_RELPEAK'])}\nONSET_MIN_IOI_MS = {g(p['ONSET_MIN_IOI_MS'])}\n"
+        f"PULSE_MS = {g(p['PULSE_MS'])}\nPULSE_DYNAMICS = {g(p['PULSE_DYNAMICS'])}\n"
+        f"TEMPO_FILL = {int(p['TEMPO_FILL'])}\nTEMPO_GATE = {int(p['TEMPO_GATE'])}\n"
+        f"TEMPO_CONF = {g(p['TEMPO_CONF'])}\n\n"
         f"AGC_TARGET = {g(p['AGC_TARGET'])}\n"
         f"AGC_SPEED = {g(p['AGC_SPEED'])}\nAGC_MAX_GAIN = {g(p['AGC_MAX_GAIN'])}\n"
         f"SQUELCH = {g(p['SQUELCH'])}\nSMTH_ALPHA = {g(p['SMTH_ALPHA'])}\n\n"
@@ -890,7 +1126,7 @@ async function tick(){
   $('sbloud').style.width=Math.min(100,sb.loud/255*100)+'%';
   $('sbthr').style.left=Math.min(100,sb.thr/255*100)+'%';
   $('sbloudv').textContent=Math.round(sb.loud);$('sbthrv').textContent=Math.round(sb.thr);
-  $('bpm').textContent=((d.tempo>0)?d.tempo:(sb.bpm>0?sb.bpm:'--'))+' BPM';
+  $('bpm').textContent=((d.tempo>0)?d.tempo:(sb.bpm>0?sb.bpm:'--'))+' BPM'+(d.tempoLocked?' (locked)':'');
   $('sbbooms').textContent=sb.booms;$('sbvis').textContent=sb.visible;$('sbpart').textContent=sb.particles;
   if(document.activeElement!==$('sblen'))$('sblen').value=sb.stripLen;  // auto-followed from WLED
   if(sb.booms>lastBooms){boomFlash=8;}lastBooms=sb.booms;
@@ -1042,7 +1278,10 @@ class _ParamPanelHandler(http.server.BaseHTTPRequestHandler):
         elif parts.path == "/data":
             tx_pps, tx_kbps = tx.current()
             ok, reason = send_gate()
-            payload = {**viz.data(), "sb": sonic.state(), "wled": wled.summary(), "tempo": tempo.bpm,
+            trk = analyzer.tracker
+            locked = trk.locked(live.snapshot())
+            payload = {**viz.data(), "sb": sonic.state(), "wled": wled.summary(),
+                       "tempo": trk.bpm() or tempo.bpm, "tempoLocked": locked,
                        "tx": {"pps": tx_pps, "kbps": tx_kbps},
                        "send": {"continuous": CONTINUOUS_SEND, "sending": ok, "reason": reason}}
             self._send(json.dumps(payload).encode("utf-8"), "application/json")
@@ -1126,6 +1365,54 @@ def start_web_panel():
         print(f"Could not start web panel (continuing without it): {e}", flush=True)
 
 
+class FramePipeline:
+    """One analysed chunk in -> (maybe) one UDP packet out, plus the Sonic Boom/tempo mirror ticked at
+    WLED's render cadence. Shared by the live capture and the offline replay so both see identical
+    bins, decimation and peak-holding."""
+
+    def __init__(self, analyzer, sonic, tempo=None):
+        self.analyzer = analyzer
+        self.sonic = sonic
+        self.tempo = tempo
+        self.frame = 0
+        self.sends = 0
+        self.last_active = None
+        self.live_audio = True         # False once SILENCE_HOLD_SEC of silence has passed
+        self.last_boom = 0             # span of the boom fired on the latest sim tick (0 = none)
+        self.acc_bins = np.zeros(NUM_BANDS, dtype=np.uint8)   # coalesce skipped frames so throttling
+        self.acc_raw, self.acc_beat = 0.0, 0                  # never drops an onset (peak-hold, OR beat)
+
+    def process(self, chunk, now, p=None):
+        """Returns (analysis result or None, packet bytes on send frames else None)."""
+        self.last_boom = 0
+        result = self.analyzer.analyse(chunk, p)
+        if result[0] is None:
+            return None, None
+        bars, raw_255, smth_255, beat, mag, freq = result
+        self.frame += 1
+
+        np.maximum(self.acc_bins, bars, out=self.acc_bins)
+        self.acc_raw = max(self.acc_raw, raw_255)
+        self.acc_beat |= int(beat)
+        if self.last_active is None or bars.any() or raw_255 > 0:
+            self.last_active = now
+
+        if self.frame % SEND_DECIMATE != 0:
+            return result, None
+        self.live_audio = now - self.last_active < SILENCE_HOLD_SEC   # else WLED holds last (off)
+        packet = create_udp_packet(self.acc_bins, self.acc_raw, smth_255, self.acc_beat, mag, freq)
+        # Mirror Sonic Boom + tempo on the exact bins WLED receives (peak-held acc_bins),
+        # decimated to its render cadence - so 'booms'/'on strip' match the real strip.
+        self.sends += 1
+        if self.sends % SB_SEND_DECIMATE == 0:
+            self.last_boom = self.sonic.tick(self.acc_bins, now)
+            if self.tempo is not None:
+                self.tempo.push(int(self.acc_bins[0]))
+        self.acc_bins[:] = 0
+        self.acc_raw, self.acc_beat = 0.0, 0
+        return result, packet
+
+
 def run_loopback():
     cmd = [
         "parec", "-r",
@@ -1144,47 +1431,22 @@ def run_loopback():
     except Exception as e:
         sys.exit(f"Error starting parec: {e}")
 
-    frame = 0
-    sends = 0
-    last_active = time.monotonic()
-    acc_bins = np.zeros(NUM_BANDS, dtype=np.uint8)   # coalesce skipped frames so throttling never
-    acc_raw, acc_beat = 0.0, 0                        # drops an onset (peak-hold bins, OR the beat)
+    pipe = FramePipeline(analyzer, sonic, tempo)
     while True:
         raw = proc.stdout.read(CHUNK_BYTES)
         if len(raw) < CHUNK_BYTES:
             print(f"Parec exited early. Stderr: {proc.stderr.read().decode()}", flush=True)
             break
-        result = analyse(raw)
-        if result[0] is None:
-            continue
-        bars, raw_255, smth_255, beat, mag, freq = result
-        viz.update(result)
-        frame += 1
-
-        np.maximum(acc_bins, bars, out=acc_bins)
-        acc_raw = max(acc_raw, raw_255)
-        acc_beat |= int(beat)
-        now = time.monotonic()
-        if bars.any() or raw_255 > 0:
-            last_active = now
-
-        if frame % SEND_DECIMATE == 0:
-            live_audio = now - last_active < SILENCE_HOLD_SEC   # else: stay silent, WLED holds last (off)
+        result, packet = pipe.process(raw, time.monotonic())
+        if result is not None:
+            viz.update(result)
+        if packet is not None:
             # Gate on presence + effect-reactivity (cheap in-memory reads; HTTP polling is off-thread,
             # and it assumes the strip is there until proven otherwise, so no startup latency here).
             strip_ok, _ = send_gate()
-            if live_audio and strip_ok:
-                packet = create_udp_packet(acc_bins, acc_raw, smth_255, acc_beat, mag, freq)
+            if pipe.live_audio and strip_ok:
                 udp_socket.sendto(packet, (WLED_IP, WLED_PORT))
                 tx.add(len(packet))
-            # Mirror Sonic Boom + tempo on the exact bins WLED receives (peak-held acc_bins),
-            # decimated to its render cadence - so 'booms'/'on strip' match the real strip.
-            sends += 1
-            if sends % SB_SEND_DECIMATE == 0:
-                sonic.tick(acc_bins)
-                tempo.push(int(acc_bins[0]))
-            acc_bins[:] = 0
-            acc_raw, acc_beat = 0.0, 0
     proc.wait()
 
 
