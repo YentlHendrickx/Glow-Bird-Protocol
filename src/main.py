@@ -48,6 +48,17 @@ HTTP_TIMEOUT = config.getfloat("WLED", "HTTP_TIMEOUT", fallback=0.6)
 # strip is there) but pause once it's been unreachable for PRESENCE_GRACE_SEC, resuming when it returns.
 CONTINUOUS_SEND = config.getboolean("WLED", "CONTINUOUS_SEND", fallback=False)
 PRESENCE_GRACE_SEC = config.getfloat("WLED", "PRESENCE_GRACE_SEC", fallback=6.0)
+# SEND_ONLY_WHEN_REACTIVE: also pause when the strip's active effect doesn't consume audio (a plain
+# Solid/Rainbow etc.), so we don't stream into an effect that ignores it. Detected from WLED's
+# /json/fxdata metadata flags (v = volume-reactive, f = frequency-reactive). Ignored if CONTINUOUS_SEND.
+SEND_ONLY_WHEN_REACTIVE = config.getboolean("WLED", "SEND_ONLY_WHEN_REACTIVE", fallback=True)
+
+if CONTINUOUS_SEND:
+    SEND_MODE_NOTE = "continuous send"
+else:
+    SEND_MODE_NOTE = f"presence-gated (grace {PRESENCE_GRACE_SEC:g} s, HTTP timeout {HTTP_TIMEOUT:g} s)"
+    if SEND_ONLY_WHEN_REACTIVE:
+        SEND_MODE_NOTE += ", reactive-effect only"
 
 SAMPLE_RATE = config.getint("Audio", "SAMPLE_RATE")
 CHUNK_BYTES = config.getint("Audio", "CHUNK_BYTES")   # bytes read per frame; controls latency only
@@ -447,6 +458,7 @@ class WledClient:
         self.error = ""
         self.info = {}
         self.effects = []
+        self.fxdata = []           # per-effect metadata tails from /json/fxdata (static per firmware)
         self.state = {}
 
     def reachable(self, grace):
@@ -482,6 +494,24 @@ class WledClient:
             self.error = str(e)
         finally:
             self.polled = True
+        # fxdata is static per firmware; fetch once (retried until it lands). Kept out of the main
+        # try so a failure here only costs reactivity detection, it doesn't flag the strip offline.
+        if self.online and not self.fxdata:
+            try:
+                self.fxdata = self._get("/json/fxdata")
+            except Exception:
+                pass
+
+    def effect_reactive(self):
+        """True if the active effect consumes audio (a v/f flag in its metadata) OR we can't tell yet
+        (fail-open, so we never wrongly go silent). WLED's /json/fxdata gives each effect's metadata
+        tail; the 4th ';' field is the flags - e.g. '1f' = 1D frequency-reactive, '1v' = volume."""
+        fx = self.active_seg().get("fx")
+        if not isinstance(fx, int) or fx >= len(self.fxdata):
+            return True                                  # unknown effect/metadata -> assume relevant
+        parts = self.fxdata[fx].split(";")
+        flags = parts[3] if len(parts) > 3 else ""
+        return ("v" in flags) or ("f" in flags)
 
     def active_seg(self):
         segs = self.state.get("seg", [])
@@ -506,6 +536,7 @@ class WledClient:
             "on": self.state.get("on"), "bri": self.state.get("bri"),
             "fx": fx, "effect": (name.split("@")[0] if name else None),
             "isSonicBoom": bool(name and name.startswith("PS Sonic Boom")),
+            "reactive": self.effect_reactive(),
             # full segment slider set - sync_sonic() uses ix/c3/o2/len today; the rest (Color c1,
             # Position c2, ...) are kept so a per-effect monitor can read them later.
             "seg": {"ix": seg.get("ix"), "c1": seg.get("c1"), "c2": seg.get("c2"),
@@ -524,6 +555,20 @@ class WledClient:
 
 
 wled = WledClient(WLED_IP, HTTP_TIMEOUT)
+
+
+def send_gate():
+    """Single source of truth for whether presence/effect gating currently permits UDP -> (ok, reason).
+    Audio-silence gating is separate (handled in the send loop). All checks are cheap in-memory reads;
+    the HTTP polling that feeds them runs off-thread, so this never adds latency to the send path."""
+    if CONTINUOUS_SEND:
+        return True, ""
+    if not wled.reachable(PRESENCE_GRACE_SEC):
+        return False, "strip unreachable"
+    if SEND_ONLY_WHEN_REACTIVE and not wled.effect_reactive():
+        return False, "effect not audio-reactive"
+    return True, ""
+
 
 SERVICE_UNIT = config.get("Web", "service", fallback="glowbird-protocol.service")
 
@@ -698,7 +743,8 @@ def build_conf_text():
     return (
         f"[WLED]\nWLED_IP = {WLED_IP}\nWLED_PORT = {WLED_PORT}\n"
         f"HTTP_TIMEOUT = {g(HTTP_TIMEOUT)}\nCONTINUOUS_SEND = {str(CONTINUOUS_SEND).lower()}\n"
-        f"PRESENCE_GRACE_SEC = {g(PRESENCE_GRACE_SEC)}\n\n"
+        f"PRESENCE_GRACE_SEC = {g(PRESENCE_GRACE_SEC)}\n"
+        f"SEND_ONLY_WHEN_REACTIVE = {str(SEND_ONLY_WHEN_REACTIVE).lower()}\n\n"
         f"[Audio]\nSAMPLE_RATE = {SAMPLE_RATE}\nCHUNK_BYTES = {CHUNK_BYTES}\n"
         f"GAIN = {g(p['GAIN'])}\n\n"
         f"FFT_WINDOW_SAMPLES = {FFT_WINDOW_SAMPLES}\n"
@@ -823,7 +869,7 @@ function renderWled(w){
   if(!w||!w.online){box.innerHTML="<div class='kv'><div class='k'>WLED</div><div class='v'>offline</div></div>";
     $('wsync').disabled=true;return;}
   $('wsync').disabled=false;
-  const cells=[['Name',w.name||'-'],['Effect',w.effect||('fx '+w.fx)],
+  const cells=[['Name',w.name||'-'],['Effect',(w.effect||('fx '+w.fx))+(w.reactive===false?' · not audio':'')],
     ['LEDs',w.leds!=null?w.leds:'-'],['Strip FPS',w.fps!=null?w.fps:'-'],
     ['Brightness',w.bri!=null?w.bri:'-'],['Power',w.on?'on':'off']];
   box.innerHTML=cells.map(c=>"<div class='kv'><div class='k'>"+c[0]+"</div><div class='v'>"+c[1]+"</div></div>").join('');
@@ -854,7 +900,7 @@ async function tick(){
   renderWled(d.wled);
   if(d.tx){$('txpps').textContent=d.tx.pps;$('txkb').textContent=d.tx.kbps;}
   if(d.send){$('sendmode').textContent=d.send.continuous?'continuous send'
-    :(d.send.gatedOff?'paused - strip unreachable':'presence-gated');}
+    :(d.send.sending?'sending':'paused - '+d.send.reason);}
 }
 async function svcStatus(){
   $('svcout').textContent='...';
@@ -954,8 +1000,7 @@ class _ParamPanelHandler(http.server.BaseHTTPRequestHandler):
             "<div class='actions'><button type='submit'>Apply</button></div>"
             f"<p class='note'>Startup only (edit conf.txt + restart): sample rate {SAMPLE_RATE} Hz &middot; "
             f"chunk {CHUNK_BYTES} B (~{CHUNK_MSEC:.1f} ms) &middot; FFT window {FFT_WINDOW_SAMPLES} samples &middot; "
-            f"send {SEND_HZ:g}/s &middot; silence stop {SILENCE_HOLD_SEC:g} s &middot; "
-            f"{'continuous send' if CONTINUOUS_SEND else f'presence-gated (grace {PRESENCE_GRACE_SEC:g} s, HTTP timeout {HTTP_TIMEOUT:g} s)'}</p>"
+            f"send {SEND_HZ:g}/s &middot; silence stop {SILENCE_HOLD_SEC:g} s &middot; {SEND_MODE_NOTE}</p>"
             "</div></form>"
             # ---- Presets ----
             "<div class='card'><h2>Presets</h2>"
@@ -996,10 +1041,10 @@ class _ParamPanelHandler(http.server.BaseHTTPRequestHandler):
             self._send(self._render_page().encode("utf-8"), "text/html; charset=utf-8")
         elif parts.path == "/data":
             tx_pps, tx_kbps = tx.current()
-            gated_off = not CONTINUOUS_SEND and not wled.reachable(PRESENCE_GRACE_SEC)
+            ok, reason = send_gate()
             payload = {**viz.data(), "sb": sonic.state(), "wled": wled.summary(), "tempo": tempo.bpm,
                        "tx": {"pps": tx_pps, "kbps": tx_kbps},
-                       "send": {"continuous": CONTINUOUS_SEND, "gatedOff": gated_off}}
+                       "send": {"continuous": CONTINUOUS_SEND, "sending": ok, "reason": reason}}
             self._send(json.dumps(payload).encode("utf-8"), "application/json")
         elif parts.path == "/sbconfig":
             f = urllib.parse.parse_qs(parts.query)
@@ -1125,9 +1170,9 @@ def run_loopback():
 
         if frame % SEND_DECIMATE == 0:
             live_audio = now - last_active < SILENCE_HOLD_SEC   # else: stay silent, WLED holds last (off)
-            # Presence gate is a cheap flag read (HTTP polling is off-thread) that assumes the strip
-            # is there until proven otherwise, so this never adds startup latency to the send path.
-            strip_ok = CONTINUOUS_SEND or wled.reachable(PRESENCE_GRACE_SEC)
+            # Gate on presence + effect-reactivity (cheap in-memory reads; HTTP polling is off-thread,
+            # and it assumes the strip is there until proven otherwise, so no startup latency here).
+            strip_ok, _ = send_gate()
             if live_audio and strip_ok:
                 packet = create_udp_packet(acc_bins, acc_raw, smth_255, acc_beat, mag, freq)
                 udp_socket.sendto(packet, (WLED_IP, WLED_PORT))
@@ -1161,8 +1206,9 @@ def main():
     if CONTINUOUS_SEND:
         print("Send mode: continuous (streaming whenever audio plays; strip presence ignored).")
     else:
+        extra = " + only while an audio-reactive effect is active" if SEND_ONLY_WHEN_REACTIVE else ""
         print(f"Send mode: presence-gated (assume strip present at startup, pause after "
-              f"{PRESENCE_GRACE_SEC:g}s unreachable; HTTP timeout {HTTP_TIMEOUT:g}s).")
+              f"{PRESENCE_GRACE_SEC:g}s unreachable{extra}; HTTP timeout {HTTP_TIMEOUT:g}s).")
     print("Starting capture -> WLED ...")
     run_loopback()
 

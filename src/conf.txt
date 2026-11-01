@@ -8,6 +8,9 @@ HTTP_TIMEOUT = 0.6
 #         unreachable for PRESENCE_GRACE_SEC seconds; resume the moment it answers again.
 CONTINUOUS_SEND = false
 PRESENCE_GRACE_SEC = 6
+# Also pause when the strip's active effect isn't audio-reactive (a plain Solid/Rainbow/etc.), so we
+# don't stream into an effect that ignores it. Detected from WLED's /json/fxdata (v/f flags).
+SEND_ONLY_WHEN_REACTIVE = true
 
 [Audio]
 SAMPLE_RATE = 48000
